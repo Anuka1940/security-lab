@@ -1,0 +1,47 @@
+Reference run — Ethereum mainnet fork block 26,000,000
+Toolchain: Foundry 1.7.1, solc 0.8.25
+
+Command:
+  cp "../final output 1.t.sol" test/
+  forge test --match-test test_flashLoanSpotOracleManipulation -vv
+
+Observed:
+  [PASS] test_flashLoanSpotOracleManipulation()
+  1. baseline spot price                   2000000000000000000000
+  2. safe max borrow for 500 WETH          800000000000
+  3. flash loan size                       2000000000000
+  4. manipulated spot price                7987999999999999999997
+  5. borrowed against manipulated value    3190399999999
+  6. attacker profit after flash loan fee  1188599999999
+  7. restored spot price                   2003001119923655241430
+  8. collateral value after restore        999996052360
+  9. outstanding debt                      3190399999999
+  10. protocol bad debt                    2190403947639
+  11. health factor (1e18 = 1.0)           266423221071422524
+  12. pool USDC remaining                  1809600000001
+
+Command:
+  forge test --match-test test_smallFlashLoanStillOverBorrows -vv
+
+Observed:
+  [PASS] test_smallFlashLoanStillOverBorrows()
+  small-loan manipulated price             2530406249999999999998
+  small-loan amount borrowed               224324999999
+
+Fixed workspace:
+  cd "../final output 2"
+  forge test --fuzz-runs 512
+
+Observed:
+  [PASS] test_sameBlockFlashPumpRevertsOnDeviation()
+  [PASS] test_twapOnlyAttackCannotOverBorrow()
+  [PASS] test_moderateVolatilityIsAccepted()
+  Suite results: 14 regression passed; 15 fuzz passed at 512 runs
+  Total: 29 passed, 0 failed
+
+Key trace ordering in the vulnerable run:
+  SimpleAMM::swapExactTokensForTokens -> reserves 4M/500, spot 7988
+  LendingPool::deposit 499.248873 WETH
+  LendingPool::maxBorrow -> SpotPriceOracle::getPrice -> SimpleAMM::spotPrice1In0
+  LendingPool::borrow 3,190,399.999999 USDC
+  FlashLoanPool settles 2,001,800 USDC
