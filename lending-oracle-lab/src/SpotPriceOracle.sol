@@ -4,9 +4,6 @@ pragma solidity =0.8.25;
 import {IPriceOracle} from "./interfaces/IPriceOracle.sol";
 import {ISimpleAMM} from "./interfaces/ISimpleAMM.sol";
 
-/// @notice Flagship-vulnerable oracle: returns the instantaneous AMM spot price.
-/// @dev Correctly normalizes decimals, but performs no freshness, sanity, or
-///      manipulation-resistance checks.
 contract SpotPriceOracle is IPriceOracle {
     ISimpleAMM public immutable amm;
     address public immutable base;

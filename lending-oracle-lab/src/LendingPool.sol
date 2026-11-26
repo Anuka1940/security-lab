@@ -4,9 +4,7 @@ pragma solidity =0.8.25;
 import {IERC20} from "./interfaces/IERC20.sol";
 import {IPriceOracle} from "./interfaces/IPriceOracle.sol";
 
-/// @title Deliberately vulnerable collateralized lending pool
-/// @notice Collateral is valued with a single external oracle call. There is no
-///         interest accrual and no liquidation engine; both are future scope.
+/// @title lending pool
 contract LendingPool {
     uint256 public constant BPS = 10_000;
 
