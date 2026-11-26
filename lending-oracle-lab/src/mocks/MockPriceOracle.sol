@@ -1,24 +1,25 @@
 // SPDX-License-Identifier: MIT
 pragma solidity =0.8.25;
 
-import {IPriceOracle} from "../interfaces/IPriceOracle.sol";
+import {IOracleFeed} from "../interfaces/IPriceOracle.sol";
 
-contract MockPriceOracle is IPriceOracle {
-    address public immutable base;
-    address public immutable quote;
-    uint256 public price;
+/// @notice Configurable static price feed for isolated credit market unit tests.
+contract StaticPriceFeed is IOracleFeed {
+    address public immutable baseAsset;
+    address public immutable quoteAsset;
+    uint256 public configuredRate;
 
-    constructor(address base_, address quote_, uint256 price_) {
-        base = base_;
-        quote = quote_;
-        price = price_;
+    constructor(address baseAsset_, address quoteAsset_, uint256 initialRate) {
+        baseAsset = baseAsset_;
+        quoteAsset = quoteAsset_;
+        configuredRate = initialRate;
     }
 
-    function setPrice(uint256 price_) external {
-        price = price_;
+    function updateRate(uint256 nextRate) external {
+        configuredRate = nextRate;
     }
 
-    function getPrice() external view returns (uint256) {
-        return price;
+    function readPrice() external view returns (uint256) {
+        return configuredRate;
     }
 }

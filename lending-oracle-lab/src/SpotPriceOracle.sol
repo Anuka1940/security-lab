@@ -1,22 +1,26 @@
 // SPDX-License-Identifier: MIT
 pragma solidity =0.8.25;
 
-import {IPriceOracle} from "./interfaces/IPriceOracle.sol";
-import {ISimpleAMM} from "./interfaces/ISimpleAMM.sol";
+import {IOracleFeed} from "./interfaces/IPriceOracle.sol";
+import {IConstantProductPool} from "./interfaces/ISimpleAMM.sol";
 
-contract SpotPriceOracle is IPriceOracle {
-    ISimpleAMM public immutable amm;
-    address public immutable base;
-    address public immutable quote;
+/// @notice Vulnerable oracle that directly exposes the AMM's unvalidated instantaneous spot ratio.
+contract InstantSpotFeed is IOracleFeed {
+    IConstantProductPool public immutable liquidityPool;
+    address public immutable baseAsset;
+    address public immutable quoteAsset;
 
-    constructor(address amm_, address base_, address quote_) {
-        amm = ISimpleAMM(amm_);
-        base = base_;
-        quote = quote_;
-        require(amm.token0() == quote_ && amm.token1() == base_, "UNSUPPORTED_ORDER");
+    constructor(address poolAddress, address baseAsset_, address quoteAsset_) {
+        liquidityPool = IConstantProductPool(poolAddress);
+        baseAsset = baseAsset_;
+        quoteAsset = quoteAsset_;
+        require(
+            liquidityPool.asset0() == quoteAsset_ && liquidityPool.asset1() == baseAsset_,
+            "TOKEN_ORDER_MISMATCH"
+        );
     }
 
-    function getPrice() external view returns (uint256) {
-        return amm.spotPrice1In0();
+    function readPrice() external view returns (uint256) {
+        return liquidityPool.quoteAsset1InAsset0();
     }
 }

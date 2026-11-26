@@ -1,151 +1,203 @@
 // SPDX-License-Identifier: MIT
 pragma solidity =0.8.25;
 
-import {BaseForkFixedTest} from "./BaseForkFixed.t.sol";
+import {HardenedForkFixture} from "./BaseForkFixed.t.sol";
 import {IERC20} from "../src/interfaces/IERC20.sol";
-import {LendingPool} from "../src/LendingPool.sol";
-import {OracleAttackReceiver} from "../src/OracleAttackReceiver.sol";
-import {TwapPriceOracle} from "../src/oracle/TwapPriceOracle.sol";
-import {ChainlinkPriceOracle} from "../src/oracle/ChainlinkPriceOracle.sol";
+import {HardenedCreditMarket} from "../src/LendingPoolFix.sol";
+import {FlashPumpExploiter} from "../src/OracleAttackReceiver.sol";
+import {GuardedTwapFeed} from "../src/oracle/TwapPriceOracle.sol";
+import {ChainlinkFeedAdapter} from "../src/oracle/ChainlinkPriceOracle.sol";
 
-contract OracleGuardRegressionTest is BaseForkFixedTest {
-    address internal constant CHAINLINK_ETH_USD = 0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419;
+/// @notice Deterministic regression suite validating the guarded TWAP oracle, hardened credit
+///         market, and Chainlink adapter against manipulation and edge-case inputs.
+contract HardenedOracleRegressionSuiteTest is HardenedForkFixture {
+    address internal constant MAINNET_CHAINLINK_ETH_USD = 0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419;
 
     function test_initialState() public {
-        assertEq(oracle.getPrice(), 2_000e18);
-        assertEq(amm.spotPrice1In0(), 2_000e18);
-        assertEq(oracle.observationCount_(), 3);
-        assertEq(lendingPool.totalCollateral(), 0);
-        assertEq(lendingPool.totalDebt(), 0);
-        assertEq(IERC20(USDC).balanceOf(address(lendingPool)), POOL_USDC_LIQUIDITY);
+        assertEq(twapFeed.readPrice(), 2_000e18);
+        assertEq(ammPool.quoteAsset1InAsset0(), 2_000e18);
+        assertEq(twapFeed.totalObservations(), 3);
+        assertEq(creditMarket.totalSuppliedCollateral(), 0);
+        assertEq(creditMarket.aggregateDebt(), 0);
+        assertEq(IERC20(MAINNET_USDC).balanceOf(address(creditMarket)), MARKET_USDC_RESERVE);
     }
 
     function test_legitimateBorrowRepayWithdraw() public {
-        _deposit(alice, 100e18);
-        uint256 maxBorrow = lendingPool.maxBorrow(alice);
-        assertEq(maxBorrow, 160_000e6);
+        _supplyWeth(borrowerAlice, 100e18);
+        uint256 creditLimit = creditMarket.availableCredit(borrowerAlice);
+        assertEq(creditLimit, 160_000e6);
 
-        vm.startPrank(alice);
-        lendingPool.borrow(100_000e6);
-        assertEq(lendingPool.debt(alice), 100_000e6);
-        assertGt(lendingPool.healthFactor(alice), 1e18);
+        vm.startPrank(borrowerAlice);
+        creditMarket.drawDebt(100_000e6);
+        assertEq(creditMarket.borrowedDebt(borrowerAlice), 100_000e6);
+        assertGt(creditMarket.positionHealth(borrowerAlice), 1e18);
 
-        IERC20(USDC).approve(address(lendingPool), 100_000e6);
-        lendingPool.repay(100_000e6);
-        lendingPool.withdraw(100e18);
+        IERC20(MAINNET_USDC).approve(address(creditMarket), 100_000e6);
+        creditMarket.settleDebt(100_000e6);
+        creditMarket.redeemCollateral(100e18);
         vm.stopPrank();
 
-        assertEq(lendingPool.debt(alice), 0);
-        assertEq(lendingPool.collateralBalance(alice), 0);
-        assertEq(IERC20(WETH).balanceOf(alice), 100e18);
+        assertEq(creditMarket.borrowedDebt(borrowerAlice), 0);
+        assertEq(creditMarket.suppliedCollateral(borrowerAlice), 0);
+        assertEq(IERC20(MAINNET_WETH).balanceOf(borrowerAlice), 100e18);
     }
 
     function test_repayIsCappedAtDebt() public {
-        _deposit(alice, 100e18);
-        vm.startPrank(alice);
-        lendingPool.borrow(100_000e6);
-        deal(USDC, alice, 150_000e6);
-        IERC20(USDC).approve(address(lendingPool), 150_000e6);
-        lendingPool.repay(150_000e6);
-        assertEq(lendingPool.debt(alice), 0);
-        assertEq(IERC20(USDC).balanceOf(alice), 50_000e6);
+        _supplyWeth(borrowerAlice, 100e18);
+        vm.startPrank(borrowerAlice);
+        creditMarket.drawDebt(100_000e6);
+        deal(MAINNET_USDC, borrowerAlice, 150_000e6);
+        IERC20(MAINNET_USDC).approve(address(creditMarket), 150_000e6);
+        creditMarket.settleDebt(150_000e6);
+        assertEq(creditMarket.borrowedDebt(borrowerAlice), 0);
+        assertEq(IERC20(MAINNET_USDC).balanceOf(borrowerAlice), 50_000e6);
         vm.stopPrank();
     }
 
     function test_withdrawBelowHealthReverts() public {
-        _deposit(alice, 100e18);
-        vm.startPrank(alice);
-        lendingPool.borrow(150_000e6);
-        vm.expectRevert();
-        lendingPool.withdraw(25e18);
+        _supplyWeth(borrowerAlice, 100e18);
+        vm.startPrank(borrowerAlice);
+        creditMarket.drawDebt(150_000e6);
+        vm.expectRevert(HardenedCreditMarket.PositionUndercollateralized.selector);
+        creditMarket.redeemCollateral(25e18);
         vm.stopPrank();
     }
 
     function test_sameBlockFlashPumpRevertsOnDeviation() public {
-        OracleAttackReceiver receiver = _deployReceiver(address(lendingPool));
+        FlashPumpExploiter exploiter = _createExploiterForMarket(address(creditMarket));
 
         vm.expectRevert();
-        receiver.attack(2_000_000e6);
+        exploiter.executeExploit(2_000_000e6);
+    }
+
+    function test_twapOnlyAttackCannotOverBorrow() public {
+        GuardedTwapFeed unguardedTwap = _deployTwapFeed(50_000);
+        _primeOracleHistory(unguardedTwap);
+        HardenedCreditMarket twapOnlyMarket = _deployCreditMarket(address(unguardedTwap));
+        deal(MAINNET_USDC, address(twapOnlyMarket), MARKET_USDC_RESERVE);
+        _supplyWethToMarket(address(twapOnlyMarket), borrowerAlice, 500e18);
+
+        uint256 fairLimit = twapOnlyMarket.availableCredit(borrowerAlice);
+        FlashPumpExploiter exploiter = _createExploiterForMarket(address(twapOnlyMarket));
+        _grantUsdc(address(exploiter), 1_300_000e6);
+
+        exploiter.executeExploit(2_000_000e6);
+
+        uint256 drawnDebt = exploiter.drawnAgainstCollateral();
+        uint256 recordedDebt = twapOnlyMarket.borrowedDebt(address(exploiter));
+        uint256 collateralWorth = twapOnlyMarket.evaluateCollateral(address(exploiter));
+        uint256 health = twapOnlyMarket.positionHealth(address(exploiter));
+
+        assertLe(drawnDebt, fairLimit);
+        assertEq(recordedDebt, drawnDebt);
+        assertLe(recordedDebt, collateralWorth);
+        assertGe(health, 1e18);
+        assertApproxEqRel(drawnDebt, 798_000e6, 0.002e18);
     }
 
     function test_staleOracleRevertsOnBorrow() public {
-        _deposit(alice, 100e18);
-        vm.warp(block.timestamp + MAX_STALENESS + 1);
+        _supplyWeth(borrowerAlice, 100e18);
+        vm.warp(block.timestamp + STALENESS_LIMIT + 1);
 
-        vm.prank(alice);
-        vm.expectRevert();
-        lendingPool.borrow(1_000e6);
+        vm.prank(borrowerAlice);
+        vm.expectRevert(abi.encodeWithSelector(GuardedTwapFeed.StaleCheckpoint.selector, STALENESS_LIMIT + 1));
+        creditMarket.drawDebt(1_000e6);
     }
 
     function test_missingRecentObservationReverts() public {
-        vm.warp(block.timestamp + TWAP_WINDOW + 5 minutes);
+        vm.warp(block.timestamp + TWAP_HORIZON + 5 minutes);
 
-        vm.expectRevert();
-        oracle.getPrice();
+        vm.expectRevert(GuardedTwapFeed.WindowUncovered.selector);
+        twapFeed.readPrice();
     }
 
     function test_moderateVolatilityIsAccepted() public {
-        OracleAttackReceiver receiver = _deployReceiver(address(lendingPool));
-        _fund(address(receiver), 100_000e6);
+        FlashPumpExploiter exploiter = _createExploiterForMarket(address(creditMarket));
+        _grantUsdc(address(exploiter), 100_000e6);
 
-        receiver.attack(140_000e6);
+        exploiter.executeExploit(140_000e6);
 
-        uint256 deviationBps = ((_currentSpot() - 2_000e18) * 10_000) / 2_000e18;
-        assertLt(deviationBps, MAX_DEVIATION_BPS);
-        assertGt(receiver.borrowedAgainstCollateral(), 0);
-        assertLe(receiver.borrowedAgainstCollateral(), 112_000e6);
+        uint256 spotShiftBps = ((_readInstantSpot() - 2_000e18) * 10_000) / 2_000e18;
+        assertLt(spotShiftBps, SPOT_DEVIATION_CAP_BPS);
+        assertGt(exploiter.drawnAgainstCollateral(), 0);
+        assertLe(exploiter.drawnAgainstCollateral(), 112_000e6);
     }
 
     function test_priceBoundsRejected() public {
-        TwapPriceOracle narrow = new TwapPriceOracle(
-            address(amm), WETH, USDC, TWAP_WINDOW, MIN_UPDATE_INTERVAL, MAX_STALENESS, 0, 3_000e18, 4_000e18
+        GuardedTwapFeed restrictedFeed = new GuardedTwapFeed(
+            address(ammPool),
+            MAINNET_WETH,
+            MAINNET_USDC,
+            TWAP_HORIZON,
+            HEARTBEAT_COOLDOWN,
+            STALENESS_LIMIT,
+            0,
+            3_000e18,
+            4_000e18
         );
-        _warmUp(narrow);
+        _primeOracleHistory(restrictedFeed);
 
-        vm.expectRevert();
-        narrow.getPrice();
+        vm.expectRevert(abi.encodeWithSelector(GuardedTwapFeed.PriceOutsideBounds.selector, 2_000e18));
+        restrictedFeed.readPrice();
     }
 
     function test_updateRateLimit() public {
-        vm.expectRevert();
-        oracle.update();
+        vm.expectRevert(GuardedTwapFeed.HeartbeatCooldownActive.selector);
+        twapFeed.recordObservation();
     }
 
     function test_decimalNormalizationAtBorrowBoundary() public {
-        _deposit(alice, 100e18);
-        assertEq(lendingPool.maxBorrow(alice), 160_000e6);
+        _supplyWeth(borrowerAlice, 100e18);
+        assertEq(creditMarket.availableCredit(borrowerAlice), 160_000e6);
 
-        vm.startPrank(alice);
-        lendingPool.borrow(160_000e6);
-        assertEq(lendingPool.debt(alice), 160_000e6);
+        vm.startPrank(borrowerAlice);
+        creditMarket.drawDebt(160_000e6);
+        assertEq(creditMarket.borrowedDebt(borrowerAlice), 160_000e6);
 
-        vm.expectRevert();
-        lendingPool.borrow(1);
+        vm.expectRevert(HardenedCreditMarket.BorrowCapacityExceeded.selector);
+        creditMarket.drawDebt(1);
         vm.stopPrank();
     }
 
     function test_chainlinkAlternativeNormalizesAndChecksStaleness() public {
-        ChainlinkPriceOracle chainlink =
-            new ChainlinkPriceOracle(CHAINLINK_ETH_USD, WETH, USDC, 2 hours, MIN_PRICE, MAX_PRICE);
+        ChainlinkFeedAdapter chainlinkAdapter = new ChainlinkFeedAdapter(
+            MAINNET_CHAINLINK_ETH_USD, MAINNET_WETH, MAINNET_USDC, 2 hours, FLOOR_PRICE_18, CEILING_PRICE_18
+        );
 
-        uint256 price = chainlink.getPrice();
-        assertGt(price, 1_000e18);
-        assertLt(price, 10_000e18);
+        uint256 normalizedQuote = chainlinkAdapter.readPrice();
+        assertGt(normalizedQuote, 1_000e18);
+        assertLt(normalizedQuote, 10_000e18);
 
         vm.warp(block.timestamp + 3 hours);
         vm.expectRevert();
-        chainlink.getPrice();
+        chainlinkAdapter.readPrice();
     }
 
     function test_constructorRejectsInvalidConfiguration() public {
-        vm.expectRevert("WINDOW_TOO_SHORT");
-        new TwapPriceOracle(
-            address(amm), WETH, USDC, 40, MIN_UPDATE_INTERVAL, MAX_STALENESS, MAX_DEVIATION_BPS, MIN_PRICE, MAX_PRICE
+        vm.expectRevert("HORIZON_TOO_SHORT");
+        new GuardedTwapFeed(
+            address(ammPool),
+            MAINNET_WETH,
+            MAINNET_USDC,
+            40,
+            HEARTBEAT_COOLDOWN,
+            STALENESS_LIMIT,
+            SPOT_DEVIATION_CAP_BPS,
+            FLOOR_PRICE_18,
+            CEILING_PRICE_18
         );
 
-        vm.expectRevert();
-        new TwapPriceOracle(
-            address(amm), WETH, USDC, TWAP_WINDOW, MIN_UPDATE_INTERVAL, MAX_STALENESS, MAX_DEVIATION_BPS, 0, MAX_PRICE
+        vm.expectRevert("INVALID_PRICE_BOUNDS");
+        new GuardedTwapFeed(
+            address(ammPool),
+            MAINNET_WETH,
+            MAINNET_USDC,
+            TWAP_HORIZON,
+            HEARTBEAT_COOLDOWN,
+            STALENESS_LIMIT,
+            SPOT_DEVIATION_CAP_BPS,
+            0,
+            CEILING_PRICE_18
         );
     }
 }

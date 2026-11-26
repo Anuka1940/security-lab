@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity =0.8.25;
 
+/// @notice Standard Chainlink AggregatorV3 interface used to query off-chain price rounds.
 interface AggregatorV3Interface {
     function decimals() external view returns (uint8);
     function description() external view returns (string memory);
@@ -9,5 +10,11 @@ interface AggregatorV3Interface {
     function latestRoundData()
         external
         view
-        returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
+        returns (
+            uint80 roundId,
+            int256 answer,
+            uint256 startedAt,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        );
 }

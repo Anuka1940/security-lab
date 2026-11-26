@@ -2,111 +2,112 @@
 pragma solidity =0.8.25;
 
 import {IERC20} from "./interfaces/IERC20.sol";
-import {IPriceOracle} from "./interfaces/IPriceOracle.sol";
+import {IOracleFeed} from "./interfaces/IPriceOracle.sol";
+import {ICreditMarket} from "./interfaces/ILendingPool.sol";
 
-/// @title lending pool
-contract LendingPool {
-    uint256 public constant BPS = 10_000;
+/// @title Baseline collateralized credit market (vulnerable to instantaneous spot price manipulation)
+contract VulnerableCreditMarket is ICreditMarket {
+    uint256 public constant BPS_SCALE = 10_000;
 
-    IERC20 public immutable collateral;
-    IERC20 public immutable borrowToken;
-    IPriceOracle public immutable oracle;
-    uint256 public immutable ltvBps;
-    uint256 public immutable liquidationThresholdBps;
-    uint8 private immutable borrowDecimals;
+    IERC20 public immutable collateralAsset;
+    IERC20 public immutable debtAsset;
+    IOracleFeed public immutable priceFeed;
+    uint256 public immutable maxLtvBps;
+    uint256 public immutable liquidationLimitBps;
+    uint8 private immutable debtDecimals;
 
-    mapping(address => uint256) public collateralBalance;
-    mapping(address => uint256) public debt;
-    uint256 public totalDebt;
+    mapping(address => uint256) public suppliedCollateral;
+    mapping(address => uint256) public borrowedDebt;
+    uint256 public aggregateDebt;
 
-    event Deposited(address indexed account, uint256 amount);
-    event Withdrawn(address indexed account, uint256 amount);
-    event Borrowed(address indexed account, uint256 amount);
-    event Repaid(address indexed account, uint256 amount);
+    event CollateralSupplied(address indexed borrower, uint256 amount);
+    event CollateralRedeemed(address indexed borrower, uint256 amount);
+    event DebtDrawn(address indexed borrower, uint256 amount);
+    event DebtSettled(address indexed borrower, uint256 amount);
 
     constructor(
-        address collateral_,
-        address borrowToken_,
-        address oracle_,
-        uint256 ltvBps_,
-        uint256 liquidationThresholdBps_
+        address collateralAsset_,
+        address debtAsset_,
+        address priceFeed_,
+        uint256 maxLtvBps_,
+        uint256 liquidationLimitBps_
     ) {
-        require(ltvBps_ > 0 && ltvBps_ <= liquidationThresholdBps_, "BAD_LTV");
-        require(liquidationThresholdBps_ <= BPS, "BAD_THRESHOLD");
-        collateral = IERC20(collateral_);
-        borrowToken = IERC20(borrowToken_);
-        oracle = IPriceOracle(oracle_);
-        ltvBps = ltvBps_;
-        liquidationThresholdBps = liquidationThresholdBps_;
-        borrowDecimals = IERC20(borrowToken_).decimals();
+        require(maxLtvBps_ > 0 && maxLtvBps_ <= liquidationLimitBps_, "INVALID_LTV_CONFIG");
+        require(liquidationLimitBps_ <= BPS_SCALE, "INVALID_LIQUIDATION_LIMIT");
+        collateralAsset = IERC20(collateralAsset_);
+        debtAsset = IERC20(debtAsset_);
+        priceFeed = IOracleFeed(priceFeed_);
+        maxLtvBps = maxLtvBps_;
+        liquidationLimitBps = liquidationLimitBps_;
+        debtDecimals = IERC20(debtAsset_).decimals();
     }
 
-    function deposit(uint256 amount) external {
+    function supplyCollateral(uint256 amount) external {
         require(amount > 0, "ZERO_AMOUNT");
-        collateral.transferFrom(msg.sender, address(this), amount);
-        collateralBalance[msg.sender] += amount;
-        emit Deposited(msg.sender, amount);
+        collateralAsset.transferFrom(msg.sender, address(this), amount);
+        suppliedCollateral[msg.sender] += amount;
+        emit CollateralSupplied(msg.sender, amount);
     }
 
-    function withdraw(uint256 amount) external {
-        require(amount > 0 && amount <= collateralBalance[msg.sender], "BAD_AMOUNT");
-        collateralBalance[msg.sender] -= amount;
-        require(_isCollateralized(msg.sender), "UNDERCOLLATERALIZED");
-        collateral.transfer(msg.sender, amount);
-        emit Withdrawn(msg.sender, amount);
+    function redeemCollateral(uint256 amount) external {
+        require(amount > 0 && amount <= suppliedCollateral[msg.sender], "INVALID_REDEEM_AMOUNT");
+        suppliedCollateral[msg.sender] -= amount;
+        require(_isHealthy(msg.sender), "POSITION_UNDERCOLLATERALIZED");
+        collateralAsset.transfer(msg.sender, amount);
+        emit CollateralRedeemed(msg.sender, amount);
     }
 
-    function borrow(uint256 amount) external {
+    function drawDebt(uint256 amount) external {
         require(amount > 0, "ZERO_AMOUNT");
-        require(amount <= maxBorrow(msg.sender), "EXCEEDS_MAX_BORROW");
-        require(amount <= borrowToken.balanceOf(address(this)), "INSUFFICIENT_LIQUIDITY");
+        require(amount <= availableCredit(msg.sender), "BORROW_CAPACITY_EXCEEDED");
+        require(amount <= debtAsset.balanceOf(address(this)), "MARKET_ILLIQUID");
 
-        debt[msg.sender] += amount;
-        totalDebt += amount;
-        borrowToken.transfer(msg.sender, amount);
-        emit Borrowed(msg.sender, amount);
+        borrowedDebt[msg.sender] += amount;
+        aggregateDebt += amount;
+        debtAsset.transfer(msg.sender, amount);
+        emit DebtDrawn(msg.sender, amount);
     }
 
-    function repay(uint256 amount) external {
+    function settleDebt(uint256 amount) external {
         require(amount > 0, "ZERO_AMOUNT");
-        uint256 owed = debt[msg.sender];
-        uint256 repaid = amount < owed ? amount : owed;
-        debt[msg.sender] = owed - repaid;
-        totalDebt -= repaid;
-        borrowToken.transferFrom(msg.sender, address(this), repaid);
-        emit Repaid(msg.sender, repaid);
+        uint256 currentLiability = borrowedDebt[msg.sender];
+        uint256 actualRepay = amount < currentLiability ? amount : currentLiability;
+        borrowedDebt[msg.sender] = currentLiability - actualRepay;
+        aggregateDebt -= actualRepay;
+        debtAsset.transferFrom(msg.sender, address(this), actualRepay);
+        emit DebtSettled(msg.sender, actualRepay);
     }
 
-    function maxBorrow(address account) public returns (uint256) {
-        uint256 value = _collateralValue(account);
-        uint256 limit = (value * ltvBps) / BPS;
-        uint256 currentDebt = debt[account];
-        return limit > currentDebt ? limit - currentDebt : 0;
+    function availableCredit(address borrower) public returns (uint256) {
+        uint256 collateralWorth = _evaluateCollateralInDebtUnits(borrower);
+        uint256 creditCeiling = (collateralWorth * maxLtvBps) / BPS_SCALE;
+        uint256 existingDebt = borrowedDebt[borrower];
+        return creditCeiling > existingDebt ? creditCeiling - existingDebt : 0;
     }
 
-    function collateralValue(address account) external returns (uint256) {
-        return _collateralValue(account);
+    function evaluateCollateral(address borrower) external returns (uint256) {
+        return _evaluateCollateralInDebtUnits(borrower);
     }
 
-    function healthFactor(address account) external returns (uint256) {
-        uint256 currentDebt = debt[account];
-        if (currentDebt == 0) return type(uint256).max;
-        uint256 liquidationValue = (_collateralValue(account) * liquidationThresholdBps) / BPS;
-        return (liquidationValue * 1e18) / currentDebt;
+    function positionHealth(address borrower) external returns (uint256) {
+        uint256 existingDebt = borrowedDebt[borrower];
+        if (existingDebt == 0) return type(uint256).max;
+        uint256 adjustedCollateral = (_evaluateCollateralInDebtUnits(borrower) * liquidationLimitBps) / BPS_SCALE;
+        return (adjustedCollateral * 1e18) / existingDebt;
     }
 
-    function _collateralValue(address account) internal returns (uint256) {
-        uint256 amount = collateralBalance[account];
-        if (amount == 0) return 0;
-        uint256 value18 = (amount * oracle.getPrice()) / 1e18;
-        if (borrowDecimals < 18) return value18 / 10 ** (18 - borrowDecimals);
-        if (borrowDecimals > 18) return value18 * 10 ** (borrowDecimals - 18);
-        return value18;
+    function _evaluateCollateralInDebtUnits(address borrower) internal returns (uint256) {
+        uint256 collateralUnits = suppliedCollateral[borrower];
+        if (collateralUnits == 0) return 0;
+        uint256 valuation18 = (collateralUnits * priceFeed.readPrice()) / 1e18;
+        if (debtDecimals < 18) return valuation18 / (10 ** (18 - debtDecimals));
+        if (debtDecimals > 18) return valuation18 * (10 ** (debtDecimals - 18));
+        return valuation18;
     }
 
-    function _isCollateralized(address account) internal returns (bool) {
-        if (debt[account] == 0) return true;
-        uint256 liquidationValue = (_collateralValue(account) * liquidationThresholdBps) / BPS;
-        return liquidationValue >= debt[account];
+    function _isHealthy(address borrower) internal returns (bool) {
+        if (borrowedDebt[borrower] == 0) return true;
+        uint256 adjustedCollateral = (_evaluateCollateralInDebtUnits(borrower) * liquidationLimitBps) / BPS_SCALE;
+        return adjustedCollateral >= borrowedDebt[borrower];
     }
 }

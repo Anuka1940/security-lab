@@ -1,184 +1,187 @@
 // SPDX-License-Identifier: MIT
 pragma solidity =0.8.25;
 
-import {IPriceOracle} from "../interfaces/IPriceOracle.sol";
-import {ISimpleAMM} from "../interfaces/ISimpleAMM.sol";
+import {IOracleFeed} from "../interfaces/IPriceOracle.sol";
+import {IConstantProductPool} from "../interfaces/ISimpleAMM.sol";
 
-/// @title Manipulation-resistant AMM TWAP oracle with validation gates
-/// @notice Collateral is priced from a time-weighted average, not the instantaneous
-///         spot price. A same-block flash-loan pump therefore cannot move the value
-///         used for borrowing. Guards reject stale, out-of-range, zero, and
-///         abnormally deviating markets. Output is always normalized to 18 decimals.
-contract TwapPriceOracle is IPriceOracle {
-    uint256 public constant BPS = 10_000;
-    uint256 public constant BUFFER_SIZE = 64;
+/// @title Time-Weighted Average Price (TWAP) oracle with multi-layer sanity and deviation guards
+/// @notice Computes collateral value from cumulative AMM price checkpoints over a rolling time
+///         horizon rather than instantaneous reserves. Rejects uninitialized buffers, stale
+///         checkpoints, missing window coverage, zero reserves, out-of-range prices, and
+///         excessive spot-versus-TWAP divergence. Always returns an 18-decimal normalized price.
+contract GuardedTwapFeed is IOracleFeed {
+    uint256 public constant BPS_SCALE = 10_000;
+    uint256 public constant RING_CAPACITY = 64;
 
-    ISimpleAMM public immutable amm;
-    address public immutable base;
-    address public immutable quote;
-    uint8 private immutable baseDecimals;
-    uint8 private immutable quoteDecimals;
+    IConstantProductPool public immutable liquidityPool;
+    address public immutable baseAsset;
+    address public immutable quoteAsset;
+    uint8 private immutable baseAssetDecimals;
+    uint8 private immutable quoteAssetDecimals;
 
-    uint32 public immutable window;
-    uint32 public immutable minUpdateInterval;
-    uint32 public immutable maxStaleness;
-    uint256 public immutable maxDeviationBps;
-    uint256 public immutable minPrice;
-    uint256 public immutable maxPrice;
+    uint32 public immutable twapHorizon;
+    uint32 public immutable heartbeatCooldown;
+    uint32 public immutable stalenessLimit;
+    uint256 public immutable deviationLimitBps;
+    uint256 public immutable floorPrice;
+    uint256 public immutable ceilingPrice;
 
-    struct Observation {
-        uint32 timestamp;
-        uint256 cumulative;
+    struct PriceCheckpoint {
+        uint32 recordedAt;
+        uint256 cumulativeValue;
     }
 
-    Observation[BUFFER_SIZE] private observations;
-    uint256 private observationCount;
+    PriceCheckpoint[RING_CAPACITY] private ringBuffer;
+    uint256 private totalCheckpoints;
 
-    error OracleNotReady();
-    error UpdateTooSoon();
-    error OracleStale(uint256 age);
-    error NoRecentObservation();
-    error InvalidSpotPrice();
-    error PriceOutOfBounds(uint256 price);
-    error ExcessiveSpotDeviation(uint256 deviationBps);
-    error UnsupportedTokenOrder();
+    error InsufficientObservations();
+    error HeartbeatCooldownActive();
+    error StaleCheckpoint(uint256 elapsedAge);
+    error WindowUncovered();
+    error ZeroSpotReserve();
+    error PriceOutsideBounds(uint256 twapPrice);
+    error SpotDeviationTooHigh(uint256 observedDeviationBps);
+    error InvalidPoolTokenOrder();
 
-    event OracleUpdated(uint32 indexed timestamp, uint256 cumulative);
+    event CheckpointRecorded(uint32 indexed timestamp, uint256 cumulativePrice);
 
     constructor(
-        address amm_,
-        address base_,
-        address quote_,
-        uint32 window_,
-        uint32 minUpdateInterval_,
-        uint32 maxStaleness_,
-        uint256 maxDeviationBps_,
-        uint256 minPrice_,
-        uint256 maxPrice_
+        address poolAddress,
+        address baseAsset_,
+        address quoteAsset_,
+        uint32 twapHorizon_,
+        uint32 heartbeatCooldown_,
+        uint32 stalenessLimit_,
+        uint256 deviationLimitBps_,
+        uint256 floorPrice_,
+        uint256 ceilingPrice_
     ) {
-        if (ISimpleAMM(amm_).token0() != quote_ || ISimpleAMM(amm_).token1() != base_) {
-            revert UnsupportedTokenOrder();
+        if (
+            IConstantProductPool(poolAddress).asset0() != quoteAsset_
+                || IConstantProductPool(poolAddress).asset1() != baseAsset_
+        ) {
+            revert InvalidPoolTokenOrder();
         }
-        require(window_ >= 2 * minUpdateInterval_, "WINDOW_TOO_SHORT");
-        require(maxStaleness_ >= minUpdateInterval_, "STALENESS_TOO_SHORT");
-        require(maxDeviationBps_ <= 1_000_000, "DEVIATION_TOO_HIGH");
-        require(minPrice_ > 0 && minPrice_ < maxPrice_, "BAD_BOUNDS");
+        require(twapHorizon_ >= 2 * heartbeatCooldown_, "HORIZON_TOO_SHORT");
+        require(stalenessLimit_ >= heartbeatCooldown_, "STALENESS_BELOW_COOLDOWN");
+        require(deviationLimitBps_ <= 1_000_000, "DEVIATION_CAP_INVALID");
+        require(floorPrice_ > 0 && floorPrice_ < ceilingPrice_, "INVALID_PRICE_BOUNDS");
 
-        amm = ISimpleAMM(amm_);
-        base = base_;
-        quote = quote_;
-        baseDecimals = _decimals(base_);
-        quoteDecimals = _decimals(quote_);
-        window = window_;
-        minUpdateInterval = minUpdateInterval_;
-        maxStaleness = maxStaleness_;
-        maxDeviationBps = maxDeviationBps_;
-        minPrice = minPrice_;
-        maxPrice = maxPrice_;
+        liquidityPool = IConstantProductPool(poolAddress);
+        baseAsset = baseAsset_;
+        quoteAsset = quoteAsset_;
+        baseAssetDecimals = _queryDecimals(baseAsset_);
+        quoteAssetDecimals = _queryDecimals(quoteAsset_);
+        twapHorizon = twapHorizon_;
+        heartbeatCooldown = heartbeatCooldown_;
+        stalenessLimit = stalenessLimit_;
+        deviationLimitBps = deviationLimitBps_;
+        floorPrice = floorPrice_;
+        ceilingPrice = ceilingPrice_;
 
-        _record();
+        _pushCheckpoint();
     }
 
-    /// @notice Permissionless heartbeat. Safe to call from a keeper.
-    function update() external {
-        Observation memory latest = _latest();
-        if (block.timestamp - latest.timestamp < minUpdateInterval) revert UpdateTooSoon();
-        _record();
+    /// @notice Permissionless keeper entrypoint to record a new cumulative price observation.
+    function recordObservation() external {
+        PriceCheckpoint memory head = _headCheckpoint();
+        if (block.timestamp - head.recordedAt < heartbeatCooldown) revert HeartbeatCooldownActive();
+        _pushCheckpoint();
     }
 
-    /// @inheritdoc IPriceOracle
-    function getPrice() external returns (uint256 price) {
-        uint256 count = observationCount;
-        if (count < 2) revert OracleNotReady();
+    /// @inheritdoc IOracleFeed
+    function readPrice() external returns (uint256 twapPrice) {
+        uint256 recordedCount = totalCheckpoints;
+        if (recordedCount < 2) revert InsufficientObservations();
 
-        uint32 now32 = uint32(block.timestamp);
-        Observation memory latest = _latest();
-        uint256 age = now32 - latest.timestamp;
-        if (age > maxStaleness) revert OracleStale(age);
+        uint32 currentTs = uint32(block.timestamp);
+        PriceCheckpoint memory head = _headCheckpoint();
+        uint256 checkpointAge = currentTs - head.recordedAt;
+        if (checkpointAge > stalenessLimit) revert StaleCheckpoint(checkpointAge);
 
-        uint32 target = now32 - window;
-        if (latest.timestamp < target) revert NoRecentObservation();
+        uint32 boundaryTs = currentTs - twapHorizon;
+        if (head.recordedAt < boundaryTs) revert WindowUncovered();
 
-        (Observation memory beforeTarget, Observation memory afterTarget) = _bracket(target);
-        if (beforeTarget.timestamp == 0) revert OracleNotReady();
+        (PriceCheckpoint memory olderPoint, PriceCheckpoint memory newerPoint) = _locateBracketingPair(boundaryTs);
+        if (olderPoint.recordedAt == 0) revert InsufficientObservations();
 
-        uint256 cumulativeAtTarget = beforeTarget.cumulative;
-        if (beforeTarget.timestamp != target) {
-            uint256 span = afterTarget.timestamp - beforeTarget.timestamp;
-            uint256 delta = afterTarget.cumulative - beforeTarget.cumulative;
-            cumulativeAtTarget += (delta * (target - beforeTarget.timestamp)) / span;
+        uint256 interpolatedCumulative = olderPoint.cumulativeValue;
+        if (olderPoint.recordedAt != boundaryTs) {
+            uint256 intervalSpan = newerPoint.recordedAt - olderPoint.recordedAt;
+            uint256 cumulativeGain = newerPoint.cumulativeValue - olderPoint.cumulativeValue;
+            interpolatedCumulative += (cumulativeGain * (boundaryTs - olderPoint.recordedAt)) / intervalSpan;
         }
 
-        amm.accrue();
-        uint256 cumulativeNow = amm.price1CumulativeLast();
-        price = (cumulativeNow - cumulativeAtTarget) / window;
+        liquidityPool.syncAccumulator();
+        uint256 currentCumulative = liquidityPool.cumulativePrice1();
+        twapPrice = (currentCumulative - interpolatedCumulative) / twapHorizon;
 
-        if (price < minPrice || price > maxPrice) revert PriceOutOfBounds(price);
+        if (twapPrice < floorPrice || twapPrice > ceilingPrice) revert PriceOutsideBounds(twapPrice);
 
-        uint256 spot = _spotPrice();
-        if (spot == 0) revert InvalidSpotPrice();
+        uint256 currentSpot = _calculateInstantSpot();
+        if (currentSpot == 0) revert ZeroSpotReserve();
 
-        uint256 deviationBps;
-        if (spot > price) {
-            deviationBps = ((spot - price) * BPS) / price;
-        } else {
-            deviationBps = ((price - spot) * BPS) / price;
-        }
-        if (deviationBps > maxDeviationBps) revert ExcessiveSpotDeviation(deviationBps);
+        uint256 observedDeviationBps = currentSpot > twapPrice
+            ? ((currentSpot - twapPrice) * BPS_SCALE) / twapPrice
+            : ((twapPrice - currentSpot) * BPS_SCALE) / twapPrice;
+
+        if (observedDeviationBps > deviationLimitBps) revert SpotDeviationTooHigh(observedDeviationBps);
     }
 
-    function latestObservation() external view returns (uint32 timestamp, uint256 cumulative) {
-        Observation memory latest = _latest();
-        return (latest.timestamp, latest.cumulative);
+    function latestCheckpoint() external view returns (uint32 recordedAt, uint256 cumulativeValue) {
+        PriceCheckpoint memory head = _headCheckpoint();
+        return (head.recordedAt, head.cumulativeValue);
     }
 
-    function observationCount_() external view returns (uint256) {
-        return observationCount;
+    function totalObservations() external view returns (uint256) {
+        return totalCheckpoints;
     }
 
-    function _record() private {
-        amm.accrue();
-        uint256 cumulative = amm.price1CumulativeLast();
-        observations[observationCount % BUFFER_SIZE] = Observation(uint32(block.timestamp), cumulative);
-        observationCount++;
-        emit OracleUpdated(uint32(block.timestamp), cumulative);
+    function _pushCheckpoint() private {
+        liquidityPool.syncAccumulator();
+        uint256 currentCumulative = liquidityPool.cumulativePrice1();
+        ringBuffer[totalCheckpoints % RING_CAPACITY] =
+            PriceCheckpoint(uint32(block.timestamp), currentCumulative);
+        totalCheckpoints++;
+        emit CheckpointRecorded(uint32(block.timestamp), currentCumulative);
     }
 
-    function _latest() private view returns (Observation memory) {
-        if (observationCount == 0) revert OracleNotReady();
-        return observations[(observationCount - 1) % BUFFER_SIZE];
+    function _headCheckpoint() private view returns (PriceCheckpoint memory) {
+        if (totalCheckpoints == 0) revert InsufficientObservations();
+        return ringBuffer[(totalCheckpoints - 1) % RING_CAPACITY];
     }
 
-    function _bracket(uint32 target)
+    function _locateBracketingPair(uint32 boundaryTs)
         private
         view
-        returns (Observation memory beforeTarget, Observation memory afterTarget)
+        returns (PriceCheckpoint memory olderPoint, PriceCheckpoint memory newerPoint)
     {
-        uint256 count = observationCount;
-        uint256 length = count < BUFFER_SIZE ? count : BUFFER_SIZE;
-        Observation memory newer;
+        uint256 recordedCount = totalCheckpoints;
+        uint256 available = recordedCount < RING_CAPACITY ? recordedCount : RING_CAPACITY;
+        PriceCheckpoint memory following;
 
-        for (uint256 i = 1; i <= length; i++) {
-            Observation memory candidate = observations[(count - i) % BUFFER_SIZE];
-            if (candidate.timestamp <= target) {
-                beforeTarget = candidate;
-                afterTarget = newer;
+        for (uint256 offset = 1; offset <= available; offset++) {
+            PriceCheckpoint memory entry = ringBuffer[(recordedCount - offset) % RING_CAPACITY];
+            if (entry.recordedAt <= boundaryTs) {
+                olderPoint = entry;
+                newerPoint = following;
                 break;
             }
-            newer = candidate;
+            following = entry;
         }
     }
 
-    function _spotPrice() private view returns (uint256) {
-        uint256 reserve0 = amm.reserve0();
-        uint256 reserve1 = amm.reserve1();
-        if (reserve0 == 0 || reserve1 == 0) return 0;
-        return (reserve0 * 10 ** baseDecimals * 1e18) / (reserve1 * 10 ** quoteDecimals);
+    function _calculateInstantSpot() private view returns (uint256) {
+        uint256 res0 = liquidityPool.poolReserve0();
+        uint256 res1 = liquidityPool.poolReserve1();
+        if (res0 == 0 || res1 == 0) return 0;
+        return (res0 * (10 ** baseAssetDecimals) * 1e18) / (res1 * (10 ** quoteAssetDecimals));
     }
 
-    function _decimals(address token) private view returns (uint8) {
-        (bool ok, bytes memory data) = token.staticcall(abi.encodeWithSignature("decimals()"));
-        require(ok && data.length >= 32, "DECIMALS_FAILED");
-        return abi.decode(data, (uint8));
+    function _queryDecimals(address tokenAddress) private view returns (uint8) {
+        (bool success, bytes memory returnData) =
+            tokenAddress.staticcall(abi.encodeWithSignature("decimals()"));
+        require(success && returnData.length >= 32, "DECIMAL_QUERY_FAILED");
+        return abi.decode(returnData, (uint8));
     }
 }

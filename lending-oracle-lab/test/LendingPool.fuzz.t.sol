@@ -1,142 +1,159 @@
 // SPDX-License-Identifier: MIT
 pragma solidity =0.8.25;
 
-import {BaseForkFixedTest} from "./BaseForkFixed.t.sol";
+import {HardenedForkFixture} from "./BaseForkFixed.t.sol";
 import {IERC20} from "../src/interfaces/IERC20.sol";
-import {LendingPool} from "../src/LendingPool.sol";
 
-contract LendingPoolFuzzTest is BaseForkFixedTest {
-    uint256 internal constant PRICE = 2_000e18;
-    uint256 internal constant USDC_SCALE = 1e12;
+/// @notice Property-based fuzz suite for lending LTV boundaries, repayments, redemptions,
+///         decimal scaling, and multi-user solvency conservation.
+contract CreditMarketFuzzSuiteTest is HardenedForkFixture {
+    uint256 internal constant EQUILIBRIUM_RATE = 2_000e18;
+    uint256 internal constant DECIMAL_DOWNSCALE = 1e12;
 
-    function testFuzz_borrowWithinLtv(uint256 collateralSeed, uint256 fractionSeed) public {
-        uint256 collateral = bound(collateralSeed, 0.1e18, 1_000e18);
-        uint256 value6 = (collateral * PRICE) / 1e18 / USDC_SCALE;
-        uint256 maxBorrow = (value6 * LTV_BPS) / 10_000;
-        uint256 borrowAmount = (maxBorrow * bound(fractionSeed, 1, 10_000)) / 10_000;
+    function testFuzz_borrowWithinLtv(uint256 rawCollateral, uint256 rawShareBps) public {
+        uint256 wethCollateral = bound(rawCollateral, 0.1e18, 1_000e18);
+        uint256 valuationUsdc = (wethCollateral * EQUILIBRIUM_RATE) / 1e18 / DECIMAL_DOWNSCALE;
+        uint256 creditCeiling = (valuationUsdc * MAX_LTV_BPS) / 10_000;
+        uint256 drawTarget = (creditCeiling * bound(rawShareBps, 1, 10_000)) / 10_000;
 
-        _deposit(alice, collateral);
-        assertEq(lendingPool.maxBorrow(alice), maxBorrow);
+        _supplyWeth(borrowerAlice, wethCollateral);
+        assertEq(creditMarket.availableCredit(borrowerAlice), creditCeiling);
 
-        vm.prank(alice);
-        lendingPool.borrow(borrowAmount);
+        vm.prank(borrowerAlice);
+        creditMarket.drawDebt(drawTarget);
 
-        assertEq(lendingPool.debt(alice), borrowAmount);
-        assertEq(lendingPool.totalDebt(), borrowAmount);
-        assertEq(IERC20(USDC).balanceOf(alice), borrowAmount);
+        assertEq(creditMarket.borrowedDebt(borrowerAlice), drawTarget);
+        assertEq(creditMarket.aggregateDebt(), drawTarget);
+        assertEq(IERC20(MAINNET_USDC).balanceOf(borrowerAlice), drawTarget);
     }
 
-    function testFuzz_oneAboveMaxReverts(uint256 collateralSeed) public {
-        uint256 collateral = bound(collateralSeed, 0.1e18, 1_000e18);
-        _deposit(alice, collateral);
+    function testFuzz_oneAboveMaxReverts(uint256 rawCollateral) public {
+        uint256 wethCollateral = bound(rawCollateral, 0.1e18, 1_000e18);
+        _supplyWeth(borrowerAlice, wethCollateral);
 
-        uint256 maxBorrow = lendingPool.maxBorrow(alice);
-        vm.prank(alice);
+        uint256 creditCeiling = creditMarket.availableCredit(borrowerAlice);
+        vm.prank(borrowerAlice);
         vm.expectRevert();
-        lendingPool.borrow(maxBorrow + 1);
+        creditMarket.drawDebt(creditCeiling + 1);
     }
 
-    function testFuzz_repayThenWithdrawRoundTrip(uint256 collateralSeed, uint256 fractionSeed) public {
-        uint256 collateral = bound(collateralSeed, 1e18, 1_000e18);
-        _deposit(alice, collateral);
+    function testFuzz_repayThenWithdrawRoundTrip(uint256 rawCollateral, uint256 rawShareBps) public {
+        uint256 wethCollateral = bound(rawCollateral, 1e18, 1_000e18);
+        _supplyWeth(borrowerAlice, wethCollateral);
 
-        uint256 maxBorrow = lendingPool.maxBorrow(alice);
-        uint256 borrowAmount = (maxBorrow * bound(fractionSeed, 1, 10_000)) / 10_000;
+        uint256 creditCeiling = creditMarket.availableCredit(borrowerAlice);
+        uint256 drawTarget = (creditCeiling * bound(rawShareBps, 1, 10_000)) / 10_000;
 
-        vm.startPrank(alice);
-        lendingPool.borrow(borrowAmount);
-        IERC20(USDC).approve(address(lendingPool), borrowAmount);
-        lendingPool.repay(borrowAmount);
-        lendingPool.withdraw(collateral);
+        vm.startPrank(borrowerAlice);
+        creditMarket.drawDebt(drawTarget);
+        IERC20(MAINNET_USDC).approve(address(creditMarket), drawTarget);
+        creditMarket.settleDebt(drawTarget);
+        creditMarket.redeemCollateral(wethCollateral);
         vm.stopPrank();
 
-        assertEq(lendingPool.debt(alice), 0);
-        assertEq(lendingPool.collateralBalance(alice), 0);
-        assertEq(IERC20(WETH).balanceOf(alice), collateral);
+        assertEq(creditMarket.borrowedDebt(borrowerAlice), 0);
+        assertEq(creditMarket.suppliedCollateral(borrowerAlice), 0);
+        assertEq(IERC20(MAINNET_WETH).balanceOf(borrowerAlice), wethCollateral);
     }
 
-    function testFuzz_partialRepay(uint256 collateralSeed, uint256 borrowFraction, uint256 repayFraction) public {
-        uint256 collateral = bound(collateralSeed, 1e18, 1_000e18);
-        _deposit(alice, collateral);
+    function testFuzz_partialRepay(
+        uint256 rawCollateral,
+        uint256 rawDrawBps,
+        uint256 rawRepayBps
+    ) public {
+        uint256 wethCollateral = bound(rawCollateral, 1e18, 1_000e18);
+        _supplyWeth(borrowerAlice, wethCollateral);
 
-        uint256 maxBorrow = lendingPool.maxBorrow(alice);
-        uint256 borrowAmount = (maxBorrow * bound(borrowFraction, 1, 10_000)) / 10_000;
-        if (borrowAmount == 0) return;
+        uint256 creditCeiling = creditMarket.availableCredit(borrowerAlice);
+        uint256 drawTarget = (creditCeiling * bound(rawDrawBps, 1, 10_000)) / 10_000;
+        if (drawTarget == 0) return;
 
-        uint256 repayAmount = (borrowAmount * bound(repayFraction, 1, 10_000)) / 10_000;
+        uint256 repayTarget = (drawTarget * bound(rawRepayBps, 1, 10_000)) / 10_000;
 
-        vm.startPrank(alice);
-        lendingPool.borrow(borrowAmount);
-        IERC20(USDC).approve(address(lendingPool), repayAmount);
-        lendingPool.repay(repayAmount);
+        vm.startPrank(borrowerAlice);
+        creditMarket.drawDebt(drawTarget);
+        IERC20(MAINNET_USDC).approve(address(creditMarket), repayTarget);
+        creditMarket.settleDebt(repayTarget);
         vm.stopPrank();
 
-        assertEq(lendingPool.debt(alice), borrowAmount - repayAmount);
-        assertEq(IERC20(USDC).balanceOf(alice), borrowAmount - repayAmount);
+        assertEq(creditMarket.borrowedDebt(borrowerAlice), drawTarget - repayTarget);
+        assertEq(IERC20(MAINNET_USDC).balanceOf(borrowerAlice), drawTarget - repayTarget);
     }
 
     function testFuzz_withdrawPreservesThreshold(
-        uint256 collateralSeed,
-        uint256 borrowFraction,
-        uint256 withdrawFraction
+        uint256 rawCollateral,
+        uint256 rawDrawBps,
+        uint256 rawRedeemBps
     ) public {
-        uint256 collateral = bound(collateralSeed, 100e18, 1_000e18);
-        _deposit(alice, collateral);
+        uint256 wethCollateral = bound(rawCollateral, 100e18, 1_000e18);
+        _supplyWeth(borrowerAlice, wethCollateral);
 
-        uint256 maxBorrow = lendingPool.maxBorrow(alice);
-        uint256 borrowAmount = (maxBorrow * bound(borrowFraction, 1, 10_000)) / 10_000;
+        uint256 creditCeiling = creditMarket.availableCredit(borrowerAlice);
+        uint256 drawTarget = (creditCeiling * bound(rawDrawBps, 1, 10_000)) / 10_000;
 
-        vm.prank(alice);
-        lendingPool.borrow(borrowAmount);
+        vm.prank(borrowerAlice);
+        creditMarket.drawDebt(drawTarget);
 
-        uint256 minCollateral =
-            _ceilDiv(borrowAmount * USDC_SCALE * 1e18 * 10_000, PRICE * LIQUIDATION_THRESHOLD_BPS) + 1e12;
-        uint256 withdrawable = collateral > minCollateral ? collateral - minCollateral : 0;
-        uint256 toWithdraw = (withdrawable * bound(withdrawFraction, 0, 10_000)) / 10_000;
+        uint256 requiredCollateral = _roundUpDiv(
+            drawTarget * DECIMAL_DOWNSCALE * 1e18 * 10_000,
+            EQUILIBRIUM_RATE * LIQ_THRESHOLD_BPS
+        ) + 1e12;
+        uint256 excessCollateral =
+            wethCollateral > requiredCollateral ? wethCollateral - requiredCollateral : 0;
+        uint256 redeemAmount = (excessCollateral * bound(rawRedeemBps, 0, 10_000)) / 10_000;
 
-        if (toWithdraw > 0) {
-            vm.prank(alice);
-            lendingPool.withdraw(toWithdraw);
+        if (redeemAmount > 0) {
+            vm.prank(borrowerAlice);
+            creditMarket.redeemCollateral(redeemAmount);
         }
 
-        if (lendingPool.debt(alice) > 0) {
-            assertGe(lendingPool.healthFactor(alice), 1e18);
+        if (creditMarket.borrowedDebt(borrowerAlice) > 0) {
+            assertGe(creditMarket.positionHealth(borrowerAlice), 1e18);
         }
     }
 
-    function testFuzz_decimalNormalization(uint256 collateralSeed) public {
-        uint256 collateral = bound(collateralSeed, 1e15, 100_000e18);
-        _deposit(alice, collateral);
+    function testFuzz_decimalNormalization(uint256 rawCollateral) public {
+        uint256 wethCollateral = bound(rawCollateral, 1e15, 100_000e18);
+        _supplyWeth(borrowerAlice, wethCollateral);
 
-        uint256 expected = (((collateral * PRICE) / 1e18) / USDC_SCALE * LTV_BPS) / 10_000;
-        assertEq(lendingPool.maxBorrow(alice), expected);
+        uint256 expectedCredit =
+            ((((wethCollateral * EQUILIBRIUM_RATE) / 1e18) / DECIMAL_DOWNSCALE) * MAX_LTV_BPS) / 10_000;
+        assertEq(creditMarket.availableCredit(borrowerAlice), expectedCredit);
     }
 
-    function testFuzz_solvencyAccounting(uint256 collateralA, uint256 collateralB, uint256 fractionA, uint256 fractionB)
-        public
-    {
-        uint256 amountA = bound(collateralA, 1e18, 1_000e18);
-        uint256 amountB = bound(collateralB, 1e18, 1_000e18);
-        _deposit(alice, amountA);
-        _deposit(bob, amountB);
+    function testFuzz_solvencyAccounting(
+        uint256 rawCollateralAlice,
+        uint256 rawCollateralBob,
+        uint256 rawDrawAliceBps,
+        uint256 rawDrawBobBps
+    ) public {
+        uint256 aliceWeth = bound(rawCollateralAlice, 1e18, 1_000e18);
+        uint256 bobWeth = bound(rawCollateralBob, 1e18, 1_000e18);
+        _supplyWeth(borrowerAlice, aliceWeth);
+        _supplyWeth(borrowerBob, bobWeth);
 
-        uint256 borrowA = (lendingPool.maxBorrow(alice) * bound(fractionA, 0, 10_000)) / 10_000;
-        if (borrowA > 0) {
-            vm.prank(alice);
-            lendingPool.borrow(borrowA);
+        uint256 aliceDraw =
+            (creditMarket.availableCredit(borrowerAlice) * bound(rawDrawAliceBps, 0, 10_000)) / 10_000;
+        if (aliceDraw > 0) {
+            vm.prank(borrowerAlice);
+            creditMarket.drawDebt(aliceDraw);
         }
 
-        uint256 borrowB = (lendingPool.maxBorrow(bob) * bound(fractionB, 0, 10_000)) / 10_000;
-        if (borrowB > 0) {
-            vm.prank(bob);
-            lendingPool.borrow(borrowB);
+        uint256 bobDraw =
+            (creditMarket.availableCredit(borrowerBob) * bound(rawDrawBobBps, 0, 10_000)) / 10_000;
+        if (bobDraw > 0) {
+            vm.prank(borrowerBob);
+            creditMarket.drawDebt(bobDraw);
         }
 
-        assertEq(IERC20(USDC).balanceOf(address(lendingPool)) + lendingPool.totalDebt(), POOL_USDC_LIQUIDITY);
-        assertEq(lendingPool.totalCollateral(), amountA + amountB);
+        assertEq(
+            IERC20(MAINNET_USDC).balanceOf(address(creditMarket)) + creditMarket.aggregateDebt(),
+            MARKET_USDC_RESERVE
+        );
+        assertEq(creditMarket.totalSuppliedCollateral(), aliceWeth + bobWeth);
     }
 
-    function _ceilDiv(uint256 a, uint256 b) private pure returns (uint256) {
-        return (a + b - 1) / b;
+    function _roundUpDiv(uint256 numerator, uint256 denominator) private pure returns (uint256) {
+        return (numerator + denominator - 1) / denominator;
     }
 }

@@ -1,147 +1,167 @@
 // SPDX-License-Identifier: MIT
 pragma solidity =0.8.25;
 
-import {BaseForkFixedTest} from "./BaseForkFixed.t.sol";
-import {TwapPriceOracle} from "../src/oracle/TwapPriceOracle.sol";
-import {ChainlinkPriceOracle} from "../src/oracle/ChainlinkPriceOracle.sol";
+import {HardenedForkFixture} from "./BaseForkFixed.t.sol";
+import {GuardedTwapFeed} from "../src/oracle/TwapPriceOracle.sol";
+import {ChainlinkFeedAdapter} from "../src/oracle/ChainlinkPriceOracle.sol";
 import {AggregatorV3Interface} from "../src/interfaces/AggregatorV3Interface.sol";
 
-contract MockAggregatorV3 is AggregatorV3Interface {
+/// @notice Controllable mock Chainlink V3 aggregator for fuzzing decimal scaling and heartbeat freshness.
+contract StubChainlinkAggregator is AggregatorV3Interface {
     uint8 public immutable decimals;
-    int256 public answer;
-    uint256 public updatedAt;
-    uint80 public roundId;
+    int256 public currentAnswer;
+    uint256 public lastUpdatedAt;
+    uint80 public currentRoundId;
 
-    constructor(uint8 decimals_, int256 answer_) {
-        decimals = decimals_;
-        answer = answer_;
-        updatedAt = block.timestamp;
-        roundId = 1;
+    constructor(uint8 feedDecimals, int256 initialAnswer) {
+        decimals = feedDecimals;
+        currentAnswer = initialAnswer;
+        lastUpdatedAt = block.timestamp;
+        currentRoundId = 1;
     }
 
     function description() external pure returns (string memory) {
-        return "mock";
+        return "stub-aggregator";
     }
 
     function version() external pure returns (uint256) {
         return 1;
     }
 
-    function setAnswer(int256 answer_, uint256 updatedAt_) external {
-        answer = answer_;
-        updatedAt = updatedAt_;
-        roundId++;
+    function pushRound(int256 nextAnswer, uint256 timestamp) external {
+        currentAnswer = nextAnswer;
+        lastUpdatedAt = timestamp;
+        currentRoundId++;
     }
 
     function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80) {
-        return (roundId, answer, updatedAt, updatedAt, roundId);
+        return (currentRoundId, currentAnswer, lastUpdatedAt, lastUpdatedAt, currentRoundId);
     }
 }
 
-contract OracleGuardFuzzTest is BaseForkFixedTest {
-    uint256 internal constant BASELINE_PRICE = 2_000e18;
+/// @notice Property-based fuzz suite for TWAP immutability under atomic swaps, deviation guard
+///         thresholds, staleness windows, heartbeat cadence, and Chainlink feed normalization.
+contract OracleGuardFuzzSuiteTest is HardenedForkFixture {
+    uint256 internal constant EQUILIBRIUM_RATE = 2_000e18;
 
-    function testFuzz_sameBlockPumpNeverMovesTwap(uint256 pumpSeed) public {
-        TwapPriceOracle twapOnly = _newOracle(1_000_000);
-        _warmUp(twapOnly);
+    function testFuzz_sameBlockPumpNeverMovesTwap(uint256 rawSwapInput) public {
+        GuardedTwapFeed wideDeviationTwap = _deployTwapFeed(1_000_000);
+        _primeOracleHistory(wideDeviationTwap);
 
-        uint256 pumpAmount = bound(pumpSeed, 1e6, 10_000_000e6);
-        _pump(pumpAmount);
+        uint256 usdcSwapIn = bound(rawSwapInput, 1e6, 10_000_000e6);
+        _buyWethWithUsdc(usdcSwapIn);
 
-        assertEq(twapOnly.getPrice(), BASELINE_PRICE);
+        assertEq(wideDeviationTwap.readPrice(), EQUILIBRIUM_RATE);
     }
 
-    function testFuzz_deviationGuardMatchesBoundary(uint256 pumpSeed) public {
-        uint256 pumpAmount = bound(pumpSeed, 1e6, 500_000e6);
-        _pump(pumpAmount);
+    function testFuzz_deviationGuardMatchesBoundary(uint256 rawSwapInput) public {
+        uint256 usdcSwapIn = bound(rawSwapInput, 1e6, 500_000e6);
+        _buyWethWithUsdc(usdcSwapIn);
 
-        uint256 spot = _currentSpot();
-        uint256 deviationBps = ((spot - BASELINE_PRICE) * 10_000) / BASELINE_PRICE;
+        uint256 postSwapSpot = _readInstantSpot();
+        uint256 observedDeviationBps =
+            ((postSwapSpot - EQUILIBRIUM_RATE) * 10_000) / EQUILIBRIUM_RATE;
 
-        if (deviationBps > MAX_DEVIATION_BPS) {
+        if (observedDeviationBps > SPOT_DEVIATION_CAP_BPS) {
             vm.expectRevert();
-            oracle.getPrice();
+            twapFeed.readPrice();
         } else {
-            assertEq(oracle.getPrice(), BASELINE_PRICE);
+            assertEq(twapFeed.readPrice(), EQUILIBRIUM_RATE);
         }
     }
 
-    function testFuzz_moderatePumpAccepted(uint256 pumpSeed) public {
-        uint256 pumpAmount = bound(pumpSeed, 1e6, 130_000e6);
-        _pump(pumpAmount);
+    function testFuzz_moderatePumpAccepted(uint256 rawSwapInput) public {
+        uint256 usdcSwapIn = bound(rawSwapInput, 1e6, 130_000e6);
+        _buyWethWithUsdc(usdcSwapIn);
 
-        uint256 spot = _currentSpot();
-        assertLe(((spot - BASELINE_PRICE) * 10_000) / BASELINE_PRICE, MAX_DEVIATION_BPS);
-        assertEq(oracle.getPrice(), BASELINE_PRICE);
-    }
-
-    function testFuzz_stalenessStates(uint256 ageSeed) public {
-        uint256 age = bound(ageSeed, 0, 3 hours);
-        vm.warp(block.timestamp + age);
-
-        if (age > MAX_STALENESS) {
-            vm.expectRevert(abi.encodeWithSelector(TwapPriceOracle.OracleStale.selector, age));
-            oracle.getPrice();
-        } else if (age > TWAP_WINDOW) {
-            vm.expectRevert();
-            oracle.getPrice();
-        } else {
-            assertEq(oracle.getPrice(), BASELINE_PRICE);
-        }
-    }
-
-    function testFuzz_updateCadence(uint256 deltaSeed) public {
-        uint256 delta = bound(deltaSeed, 0, 2 * MIN_UPDATE_INTERVAL);
-        uint256 countBefore = oracle.observationCount_();
-        vm.warp(block.timestamp + delta);
-
-        if (delta < MIN_UPDATE_INTERVAL) {
-            vm.expectRevert();
-            oracle.update();
-        } else {
-            oracle.update();
-            assertEq(oracle.observationCount_(), countBefore + 1);
-            (uint32 timestamp,) = oracle.latestObservation();
-            assertEq(timestamp, block.timestamp);
-        }
-    }
-
-    function testFuzz_minPriceBoundRejected(uint256 minSeed) public {
-        uint256 minPrice = bound(minSeed, 2_001e18, 99_999e18);
-        TwapPriceOracle narrow = new TwapPriceOracle(
-            address(amm), WETH, USDC, TWAP_WINDOW, MIN_UPDATE_INTERVAL, MAX_STALENESS, 0, minPrice, MAX_PRICE
+        uint256 postSwapSpot = _readInstantSpot();
+        assertLe(
+            ((postSwapSpot - EQUILIBRIUM_RATE) * 10_000) / EQUILIBRIUM_RATE,
+            SPOT_DEVIATION_CAP_BPS
         );
-        _warmUp(narrow);
+        assertEq(twapFeed.readPrice(), EQUILIBRIUM_RATE);
+    }
+
+    function testFuzz_stalenessStates(uint256 rawTimeJump) public {
+        uint256 elapsed = bound(rawTimeJump, 0, 3 hours);
+        vm.warp(block.timestamp + elapsed);
+
+        if (elapsed > STALENESS_LIMIT) {
+            vm.expectRevert(abi.encodeWithSelector(GuardedTwapFeed.StaleCheckpoint.selector, elapsed));
+            twapFeed.readPrice();
+        } else if (elapsed > TWAP_HORIZON) {
+            vm.expectRevert();
+            twapFeed.readPrice();
+        } else {
+            assertEq(twapFeed.readPrice(), EQUILIBRIUM_RATE);
+        }
+    }
+
+    function testFuzz_updateCadence(uint256 rawInterval) public {
+        uint256 waitDuration = bound(rawInterval, 0, 2 * HEARTBEAT_COOLDOWN);
+        uint256 priorCount = twapFeed.totalObservations();
+        vm.warp(block.timestamp + waitDuration);
+
+        if (waitDuration < HEARTBEAT_COOLDOWN) {
+            vm.expectRevert();
+            twapFeed.recordObservation();
+        } else {
+            twapFeed.recordObservation();
+            assertEq(twapFeed.totalObservations(), priorCount + 1);
+            (uint32 checkpointTs,) = twapFeed.latestCheckpoint();
+            assertEq(checkpointTs, block.timestamp);
+        }
+    }
+
+    function testFuzz_minPriceBoundRejected(uint256 rawFloor) public {
+        uint256 customFloor = bound(rawFloor, 2_001e18, 99_999e18);
+        GuardedTwapFeed highFloorFeed = new GuardedTwapFeed(
+            address(ammPool),
+            MAINNET_WETH,
+            MAINNET_USDC,
+            TWAP_HORIZON,
+            HEARTBEAT_COOLDOWN,
+            STALENESS_LIMIT,
+            0,
+            customFloor,
+            CEILING_PRICE_18
+        );
+        _primeOracleHistory(highFloorFeed);
 
         vm.expectRevert();
-        narrow.getPrice();
+        highFloorFeed.readPrice();
     }
 
-    function testFuzz_chainlinkDecimalNormalization(uint8 feedDecimals, uint256 answerSeed) public {
-        feedDecimals = uint8(bound(feedDecimals, 0, 18));
-        uint256 maxAnswer = 10_000 * 10 ** feedDecimals;
-        uint256 answer = bound(answerSeed, 1, maxAnswer);
+    function testFuzz_chainlinkDecimalNormalization(uint8 rawDecimals, uint256 rawAnswer) public {
+        uint8 feedDecimals = uint8(bound(rawDecimals, 0, 18));
+        uint256 maxRawAnswer = 10_000 * (10 ** feedDecimals);
+        uint256 answerValue = bound(rawAnswer, 1, maxRawAnswer);
 
-        MockAggregatorV3 feed = new MockAggregatorV3(feedDecimals, int256(answer));
-        ChainlinkPriceOracle chainlink = new ChainlinkPriceOracle(address(feed), WETH, USDC, 2 hours, 1, 100_000e18);
+        StubChainlinkAggregator aggregator =
+            new StubChainlinkAggregator(feedDecimals, int256(answerValue));
+        ChainlinkFeedAdapter adapter = new ChainlinkFeedAdapter(
+            address(aggregator), MAINNET_WETH, MAINNET_USDC, 2 hours, 1, 100_000e18
+        );
 
-        uint256 expected = answer * 10 ** (18 - feedDecimals);
-        assertEq(chainlink.getPrice(), expected);
+        uint256 expectedNormalized = answerValue * (10 ** (18 - feedDecimals));
+        assertEq(adapter.readPrice(), expectedNormalized);
     }
 
-    function testFuzz_chainlinkStaleness(uint256 ageSeed) public {
-        uint256 age = bound(ageSeed, 0, 2 hours);
-        MockAggregatorV3 feed = new MockAggregatorV3(8, 2_000e8);
-        feed.setAnswer(2_000e8, block.timestamp);
-        ChainlinkPriceOracle chainlink = new ChainlinkPriceOracle(address(feed), WETH, USDC, 1 hours, 1, 100_000e18);
+    function testFuzz_chainlinkStaleness(uint256 rawAge) public {
+        uint256 elapsedAge = bound(rawAge, 0, 2 hours);
+        StubChainlinkAggregator aggregator = new StubChainlinkAggregator(8, 2_000e8);
+        aggregator.pushRound(2_000e8, block.timestamp);
+        ChainlinkFeedAdapter adapter = new ChainlinkFeedAdapter(
+            address(aggregator), MAINNET_WETH, MAINNET_USDC, 1 hours, 1, 100_000e18
+        );
 
-        vm.warp(block.timestamp + age);
+        vm.warp(block.timestamp + elapsedAge);
 
-        if (age > 1 hours) {
+        if (elapsedAge > 1 hours) {
             vm.expectRevert();
-            chainlink.getPrice();
+            adapter.readPrice();
         } else {
-            assertEq(chainlink.getPrice(), 2_000e18);
+            assertEq(adapter.readPrice(), 2_000e18);
         }
     }
 }
