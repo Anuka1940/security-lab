@@ -7,9 +7,6 @@ import {IFlashLoanCallback} from "./interfaces/IFlashBorrower.sol";
 import {ICreditMarket} from "./interfaces/ILendingPool.sol";
 import {AtomicFlashVault} from "./FlashLoanPool.sol";
 
-/// @notice Exploit contract that takes a stablecoin flash loan, buys WETH to skew the AMM spot
-///         reserve ratio, posts the acquired WETH as collateral, borrows against the distorted
-///         valuation, settles the flash loan, and forwards the net surplus to the attacker.
 contract FlashPumpExploiter is IFlashLoanCallback {
     IERC20 public immutable stableToken;
     IERC20 public immutable collateralToken;
