@@ -7,14 +7,15 @@ import {ConstantProductPool} from "../src/SimpleAMM.sol";
 import {HardenedCreditMarket} from "../src/LendingPoolFix.sol";
 import {AtomicFlashVault} from "../src/FlashLoanPool.sol";
 import {FlashPumpExploiter} from "../src/OracleAttackReceiver.sol";
-import {GuardedTwapFeed} from "../src/oracle/TwapPriceOracle.sol";
+import {ChainlinkFeedAdapter} from "../src/oracle/ChainlinkPriceOracle.sol";
 
-/// @notice Pinned Ethereum mainnet fork harness for the hardened TWAP-backed credit market.
+/// @notice Pinned Ethereum mainnet fork harness for the hardened Chainlink-backed credit market.
 abstract contract HardenedForkFixture is Test {
     uint256 internal constant PINNED_FORK_BLOCK = 26_000_000;
 
     address internal constant MAINNET_USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
     address internal constant MAINNET_WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address internal constant MAINNET_CHAINLINK_ETH_USD = 0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419;
 
     uint256 internal constant INITIAL_AMM_USDC = 2_000_000e6;
     uint256 internal constant INITIAL_AMM_WETH = 1_000e18;
@@ -24,21 +25,16 @@ abstract contract HardenedForkFixture is Test {
     uint256 internal constant LIQ_THRESHOLD_BPS = 8_500;
     uint256 internal constant FLASH_FEE_BPS = 9;
 
-    uint32 internal constant TWAP_HORIZON = 30 minutes;
-    uint32 internal constant HEARTBEAT_COOLDOWN = 5 minutes;
-    uint32 internal constant STALENESS_LIMIT = 40 minutes;
-    uint256 internal constant SPOT_DEVIATION_CAP_BPS = 1_500;
+    uint256 internal constant MAX_HEARTBEAT_AGE = 2 hours;
     uint256 internal constant FLOOR_PRICE_18 = 100e18;
     uint256 internal constant CEILING_PRICE_18 = 100_000e18;
 
     address internal operator = makeAddr("operator");
     address internal borrowerAlice = makeAddr("borrowerAlice");
-    address internal borrowerBob = makeAddr("borrowerBob");
     address internal exploiterOwner = makeAddr("exploiterOwner");
-    address internal arbitrageBot = makeAddr("arbitrageBot");
 
     ConstantProductPool internal ammPool;
-    GuardedTwapFeed internal twapFeed;
+    ChainlinkFeedAdapter internal chainlinkFeed;
     HardenedCreditMarket internal creditMarket;
     AtomicFlashVault internal flashVault;
 
@@ -48,8 +44,8 @@ abstract contract HardenedForkFixture is Test {
         startHoax(operator);
         ammPool = new ConstantProductPool(MAINNET_USDC, MAINNET_WETH);
         flashVault = new AtomicFlashVault(MAINNET_USDC, FLASH_FEE_BPS);
-        twapFeed = _deployTwapFeed(SPOT_DEVIATION_CAP_BPS);
-        creditMarket = _deployCreditMarket(address(twapFeed));
+        chainlinkFeed = _deployChainlinkFeed();
+        creditMarket = _deployCreditMarket(address(chainlinkFeed));
 
         deal(
             MAINNET_USDC,
@@ -64,20 +60,15 @@ abstract contract HardenedForkFixture is Test {
 
         IERC20(MAINNET_USDC).transfer(address(creditMarket), MARKET_USDC_RESERVE);
         IERC20(MAINNET_USDC).transfer(address(flashVault), FLASH_VAULT_USDC);
-
-        _primeOracleHistory(twapFeed);
         vm.stopPrank();
     }
 
-    function _deployTwapFeed(uint256 deviationLimitBps) internal returns (GuardedTwapFeed feedInstance) {
-        feedInstance = new GuardedTwapFeed(
-            address(ammPool),
+    function _deployChainlinkFeed() internal returns (ChainlinkFeedAdapter feedInstance) {
+        feedInstance = new ChainlinkFeedAdapter(
+            MAINNET_CHAINLINK_ETH_USD,
             MAINNET_WETH,
             MAINNET_USDC,
-            TWAP_HORIZON,
-            HEARTBEAT_COOLDOWN,
-            STALENESS_LIMIT,
-            deviationLimitBps,
+            MAX_HEARTBEAT_AGE,
             FLOOR_PRICE_18,
             CEILING_PRICE_18
         );
@@ -89,47 +80,11 @@ abstract contract HardenedForkFixture is Test {
         );
     }
 
-    function _primeOracleHistory(GuardedTwapFeed feedInstance) internal {
-        vm.warp(block.timestamp + TWAP_HORIZON);
-        feedInstance.recordObservation();
-        vm.warp(block.timestamp + TWAP_HORIZON);
-        feedInstance.recordObservation();
-    }
-
-    function _advanceAndRecordHeartbeat() internal {
-        vm.warp(block.timestamp + HEARTBEAT_COOLDOWN);
-        twapFeed.recordObservation();
-    }
-
     function _supplyWeth(address user, uint256 wethAmount) internal {
         deal(MAINNET_WETH, user, wethAmount);
         vm.startPrank(user);
         IERC20(MAINNET_WETH).approve(address(creditMarket), wethAmount);
         creditMarket.supplyCollateral(wethAmount);
-        vm.stopPrank();
-    }
-
-    function _supplyWethToMarket(address targetMarket, address user, uint256 wethAmount) internal {
-        deal(MAINNET_WETH, user, wethAmount);
-        vm.startPrank(user);
-        IERC20(MAINNET_WETH).approve(targetMarket, wethAmount);
-        HardenedCreditMarket(targetMarket).supplyCollateral(wethAmount);
-        vm.stopPrank();
-    }
-
-    function _buyWethWithUsdc(uint256 usdcIn) internal returns (uint256 wethOut) {
-        deal(MAINNET_USDC, arbitrageBot, usdcIn);
-        vm.startPrank(arbitrageBot);
-        IERC20(MAINNET_USDC).approve(address(ammPool), usdcIn);
-        wethOut = ammPool.swapExactIn(usdcIn, 0, MAINNET_USDC, arbitrageBot);
-        vm.stopPrank();
-    }
-
-    function _sellWethForUsdc(uint256 wethIn) internal {
-        deal(MAINNET_WETH, arbitrageBot, wethIn);
-        vm.startPrank(arbitrageBot);
-        IERC20(MAINNET_WETH).approve(address(ammPool), wethIn);
-        ammPool.swapExactIn(wethIn, 0, MAINNET_WETH, arbitrageBot);
         vm.stopPrank();
     }
 
@@ -142,13 +97,5 @@ abstract contract HardenedForkFixture is Test {
             address(flashVault),
             exploiterOwner
         );
-    }
-
-    function _grantUsdc(address recipient, uint256 usdcAmount) internal {
-        deal(MAINNET_USDC, recipient, usdcAmount);
-    }
-
-    function _readInstantSpot() internal view returns (uint256) {
-        return ammPool.quoteAsset1InAsset0();
     }
 }

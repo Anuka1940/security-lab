@@ -4,7 +4,7 @@ pragma solidity =0.8.25;
 import {IERC20} from "./interfaces/IERC20.sol";
 import {IConstantProductPool} from "./interfaces/ISimpleAMM.sol";
 
-/// @notice Constant-product automated market maker with a 0.30% swap fee and cumulative price accumulator.
+/// @notice Constant-product automated market maker with a 0.30% swap fee.
 /// @dev Token addresses are sorted at construction: `asset0` is the lower address (USDC on mainnet)
 ///      and `asset1` is the higher address (WETH on mainnet).
 contract ConstantProductPool is IConstantProductPool {
@@ -18,8 +18,6 @@ contract ConstantProductPool is IConstantProductPool {
 
     uint112 public poolReserve0;
     uint112 public poolReserve1;
-    uint32 public lastUpdateTimestamp;
-    uint256 public cumulativePrice1;
 
     uint256 public totalLpShares;
     mapping(address => uint256) public lpSharesOf;
@@ -43,11 +41,10 @@ contract ConstantProductPool is IConstantProductPool {
         asset1 = sorted1;
         decimals0 = IERC20(sorted0).decimals();
         decimals1 = IERC20(sorted1).decimals();
-        lastUpdateTimestamp = uint32(block.timestamp);
     }
 
-    function currentReserves() external view returns (uint112, uint112, uint32) {
-        return (poolReserve0, poolReserve1, lastUpdateTimestamp);
+    function currentReserves() external view returns (uint112, uint112) {
+        return (poolReserve0, poolReserve1);
     }
 
     /// @notice Instantaneous price of 1 unit of `asset1` in terms of `asset0`, scaled to 1e18.
@@ -62,19 +59,7 @@ contract ConstantProductPool is IConstantProductPool {
         return (uint256(poolReserve1) * (10 ** decimals0) * 1e18) / (uint256(poolReserve0) * (10 ** decimals1));
     }
 
-    /// @notice Advances the time-weighted cumulative price accumulator using the pre-trade reserve ratio.
-    function syncAccumulator() public {
-        uint32 currentTs = uint32(block.timestamp);
-        uint32 timeDelta = currentTs - lastUpdateTimestamp;
-        if (timeDelta > 0 && poolReserve0 > 0 && poolReserve1 > 0) {
-            cumulativePrice1 += quoteAsset1InAsset0() * timeDelta;
-            lastUpdateTimestamp = currentTs;
-        }
-    }
-
     function provideLiquidity(uint256 deposit0, uint256 deposit1) external returns (uint256 mintedShares) {
-        syncAccumulator();
-
         uint256 existingShares = totalLpShares;
         if (existingShares == 0) {
             mintedShares = _integerSqrt(deposit0 * deposit1);
@@ -100,7 +85,6 @@ contract ConstantProductPool is IConstantProductPool {
         returns (uint256 out0, uint256 out1)
     {
         require(sharesToBurn > 0, "ZERO_LP_BURN");
-        syncAccumulator();
 
         uint256 existingShares = totalLpShares;
         out0 = (uint256(poolReserve0) * sharesToBurn) / existingShares;
@@ -123,8 +107,6 @@ contract ConstantProductPool is IConstantProductPool {
     {
         require(amountIn > 0, "ZERO_SWAP_INPUT");
         require(recipient != address(0), "INVALID_RECIPIENT");
-
-        syncAccumulator();
 
         bool sellingAsset0 = tokenIn == asset0;
         require(sellingAsset0 || tokenIn == asset1, "UNSUPPORTED_ASSET");

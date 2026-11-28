@@ -5,7 +5,7 @@ import {IERC20} from "./interfaces/IERC20.sol";
 import {IOracleFeed} from "./interfaces/IPriceOracle.sol";
 import {ICreditMarket} from "./interfaces/ILendingPool.sol";
 
-/// @title Hardened collateralized credit market paired with a validated TWAP oracle
+/// @title Hardened collateralized credit market paired with a validated Chainlink oracle
 /// @notice Security upgrades over the vulnerable baseline:
 ///         - prices collateral via a manipulation-resistant oracle feed,
 ///         - enforces reentrancy protection across all state-changing operations,
